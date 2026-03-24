@@ -4,12 +4,13 @@
 set -e
 
 # Configuration
-# Both general and onerec use datasets starting with pretrain
+# General pretrain comes from raw_data; recommendation pretrain parquet is generated into project output/
 GENERAL_TEXT_PATH="../raw_data/general_text/pretrain"
-REC_DATA_PATH="../raw_data/onerec_data"
+REC_DATA_PATH="../output"
 OUTPUT_DIR="../output/split_data_pretrain"
-MAX_ROWS=1000
-ENGINE="pyarrow"
+MAX_ROWS="${MAX_ROWS:-1000}"
+ENGINE="${ENGINE:-pyarrow}"
+STREAMING_BATCH_SIZE="${STREAMING_BATCH_SIZE:-5000}"
 
 # Check if paths exist
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,7 +29,8 @@ fi
 python3 "${SCRIPT_DIR}/scripts/split_data.py" \
     --general_text_path "${GENERAL_TEXT_PATH}" \
     --rec_data_path "${REC_DATA_PATH}" \
+    --rec_glob "pretrain_*.parquet" \
     --output_dir "${OUTPUT_DIR}" \
     --max_rows "${MAX_ROWS}" \
-    --engine "${ENGINE}"
-
+    --engine "${ENGINE}" \
+    --streaming_batch_size "${STREAMING_BATCH_SIZE}"

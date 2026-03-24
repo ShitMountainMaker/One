@@ -13,6 +13,8 @@ import uuid
 import random
 from pathlib import Path
 from tqdm import tqdm
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # ============== Configuration ==============
 SID_FORMAT = '<|sid_begin|><s_a_{c0}><s_b_{c1}><s_c_{c2}><|sid_end|>'
@@ -107,6 +109,7 @@ def main():
     parser.add_argument('--pid2sid', type=str, required=True, help='pid2sid mapping parquet path')
     parser.add_argument('--output_dir', type=str, required=True, help='Output directory')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--batch_size', type=int, default=100000, help='Rows per parquet batch')
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -119,25 +122,47 @@ def main():
     pid2sid = dict(zip(df_pid2sid['pid'], df_pid2sid['sid']))
     print(f"  Loaded {len(pid2sid):,} mappings")
 
-    # 2. Load caption data
-    print(f"Loading caption data from {args.input}...")
-    df = pd.read_parquet(args.input)
-    print(f"  Loaded {len(df):,} rows")
-
-    # 3. Process data
-    print("Processing...")
-    results = []
-    for _, row in tqdm(df.iterrows(), total=len(df)):
-        result = process_row(row, pid2sid)
-        if result:
-            results.append(result)
-
-    # 4. Save results
-    df_output = pd.DataFrame(results)
     output_path = output_dir / 'train.parquet'
-    df_output.to_parquet(output_path, index=False)
 
-    print(f"Saved: {output_path} ({len(df_output):,} rows)")
+    # 2. Stream caption data and write parquet incrementally to avoid OOM on full pid2caption.
+    print(f"Loading caption data from {args.input}...")
+    parquet_file = pq.ParquetFile(args.input)
+    total_rows = parquet_file.metadata.num_rows
+    print(f"  Loaded metadata for {total_rows:,} rows")
+
+    print("Processing...")
+    writer = None
+    saved_rows = 0
+
+    try:
+        with tqdm(total=total_rows) as pbar:
+            for batch in parquet_file.iter_batches(
+                batch_size=args.batch_size,
+                columns=['pid', 'dense_caption'],
+            ):
+                df_batch = batch.to_pandas()
+                results = []
+                for _, row in df_batch.iterrows():
+                    result = process_row(row, pid2sid)
+                    if result:
+                        results.append(result)
+
+                if results:
+                    table = pa.Table.from_pylist(results)
+                    if writer is None:
+                        writer = pq.ParquetWriter(output_path, table.schema)
+                    writer.write_table(table)
+                    saved_rows += len(results)
+
+                pbar.update(len(df_batch))
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if writer is None:
+        pd.DataFrame(columns=['source', 'uuid', 'messages', 'metadata']).to_parquet(output_path, index=False)
+
+    print(f"Saved: {output_path} ({saved_rows:,} rows)")
     print("Done!")
 
 

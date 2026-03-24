@@ -9,9 +9,10 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import List
+from typing import Iterable, List, Tuple
 
 import pandas as pd
+import pyarrow.parquet as pq
 from tqdm import tqdm
 
 # Configure logging
@@ -23,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def find_parquet_files(directory: str, recursive: bool = True) -> List[str]:
+def find_parquet_files(directory: str, recursive: bool = True, glob_pattern: str | None = None) -> List[str]:
     """Find all parquet files in the directory.
 
     Args:
@@ -40,10 +41,118 @@ def find_parquet_files(directory: str, recursive: bool = True) -> List[str]:
     if not dir_path.is_dir():
         raise ValueError(f"Path is not a directory: {directory}")
     
-    pattern = "**/*.parquet" if recursive else "*.parquet"
+    pattern = glob_pattern or ("**/*.parquet" if recursive else "*.parquet")
     parquet_files = [str(p) for p in dir_path.glob(pattern) if p.is_file()]
     
     return sorted(parquet_files)
+
+
+def collect_input_files(path: str, recursive: bool = True, glob_pattern: str | None = None) -> List[str]:
+    """Resolve either a file path or a directory of parquet files."""
+    input_path = Path(path)
+    if input_path.is_file():
+        return [str(input_path)]
+    return find_parquet_files(path, recursive=recursive, glob_pattern=glob_pattern)
+
+
+def inspect_parquet_files(file_paths: List[str]) -> Tuple[int, List[str]]:
+    """Inspect parquet metadata without loading the full dataset into memory."""
+    total_rows = 0
+    columns: List[str] = []
+    seen = set()
+
+    for file_path in file_paths:
+        parquet_file = pq.ParquetFile(file_path)
+        total_rows += parquet_file.metadata.num_rows
+        for column_name in parquet_file.schema_arrow.names:
+            if column_name not in seen:
+                seen.add(column_name)
+                columns.append(column_name)
+
+    return total_rows, columns
+
+
+def normalize_dataframe(df: pd.DataFrame, target_columns: List[str]) -> pd.DataFrame:
+    """Fill missing columns so every output shard has a stable schema."""
+    missing_columns = [column for column in target_columns if column not in df.columns]
+    for column in missing_columns:
+        df[column] = None
+    return df[target_columns]
+
+
+def iter_parquet_batches(
+    file_paths: List[str],
+    target_columns: List[str],
+    batch_size: int,
+) -> Iterable[pd.DataFrame]:
+    """Stream parquet data as normalized pandas batches."""
+    for file_path in tqdm(file_paths, desc="Streaming files"):
+        parquet_file = pq.ParquetFile(file_path)
+        for batch in parquet_file.iter_batches(batch_size=batch_size):
+            yield normalize_dataframe(batch.to_pandas(), target_columns)
+
+
+def stream_split_dataframe(
+    general_text_files: List[str],
+    rec_data_files: List[str],
+    max_rows: int,
+    output_dir: str,
+    target_columns: List[str],
+    total_rows: int,
+    batch_size: int,
+    prefix: str = "part",
+) -> List[str]:
+    """Stream inputs into fixed-size parquet shards without loading everything at once."""
+    if total_rows == 0:
+        logger.warning("No rows found, no need to split")
+        return []
+
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+
+    num_chunks = (total_rows + max_rows - 1) // max_rows
+    num_digits = 5
+    output_files: List[str] = []
+
+    current_parts: List[pd.DataFrame] = []
+    current_rows = 0
+    chunk_idx = 0
+
+    def flush_chunk() -> None:
+        nonlocal current_parts, current_rows, chunk_idx
+        if current_rows == 0:
+            return
+
+        output_filename = f"{prefix}-{chunk_idx:0{num_digits}d}-of-{num_chunks:0{num_digits}d}.parquet"
+        output_path = output_dir_path / output_filename
+        pd.concat(current_parts, ignore_index=True).to_parquet(
+            output_path,
+            engine="pyarrow",
+            index=False,
+            compression="snappy",
+        )
+        output_files.append(str(output_path))
+        current_parts = []
+        current_rows = 0
+        chunk_idx += 1
+
+    for df in iter_parquet_batches(general_text_files + rec_data_files, target_columns, batch_size=batch_size):
+        start_idx = 0
+        while start_idx < len(df):
+            remaining = max_rows - current_rows
+            chunk = df.iloc[start_idx:start_idx + remaining]
+            current_parts.append(chunk)
+            current_rows += len(chunk)
+            start_idx += len(chunk)
+
+            if current_rows == max_rows:
+                flush_chunk()
+
+    if current_rows > 0:
+        flush_chunk()
+
+    logger.info(f"Successfully split into {len(output_files)} files")
+    return output_files
 
 
 def load_all_parquet_files(file_paths: List[str], engine: str = 'pyarrow') -> pd.DataFrame:
@@ -184,6 +293,24 @@ def main():
         action='store_true',
         help='Do not recursively search for files in subdirectories'
     )
+    parser.add_argument(
+        '--general_glob',
+        type=str,
+        default=None,
+        help='Optional parquet glob pattern under general_text_path, e.g. filtered_*.parquet'
+    )
+    parser.add_argument(
+        '--rec_glob',
+        type=str,
+        default=None,
+        help='Optional parquet glob pattern under rec_data_path, e.g. sft_*.parquet'
+    )
+    parser.add_argument(
+        '--streaming_batch_size',
+        type=int,
+        default=5000,
+        help='Rows per streaming parquet batch when engine=pyarrow (default: 5000)'
+    )
     
     args = parser.parse_args()
 
@@ -196,65 +323,71 @@ def main():
         # 1. Find all parquet files
         logger.info("=" * 60)
         logger.info("Step 1: Finding general text data files...")
-        general_text_path = Path(args.general_text_path)
-        if general_text_path.is_file():
-            general_text_files = [str(general_text_path)]
-        else:
-            general_text_files = find_parquet_files(
-                args.general_text_path,
-                recursive=not args.no_recursive
-            )
+        general_text_files = collect_input_files(
+            args.general_text_path,
+            recursive=not args.no_recursive,
+            glob_pattern=args.general_glob,
+        )
         logger.info(f"Found {len(general_text_files)} general text files")
 
         logger.info("Step 2: Finding recommendation data files...")
-        rec_data_path = Path(args.rec_data_path)
-        if rec_data_path.is_file():
-            rec_data_files = [str(rec_data_path)]
-        else:
-            rec_data_files = find_parquet_files(
-                args.rec_data_path,
-                recursive=not args.no_recursive
-            )
+        rec_data_files = collect_input_files(
+            args.rec_data_path,
+            recursive=not args.no_recursive,
+            glob_pattern=args.rec_glob,
+        )
         logger.info(f"Found {len(rec_data_files)} recommendation data files")
-        
-        # 2. Load all files
         logger.info("=" * 60)
-        logger.info("Step 3: Loading general text data...")
-        general_text_df = load_all_parquet_files(general_text_files, engine=args.engine)
+        logger.info("Step 3: Inspecting parquet metadata...")
+        general_total_rows, general_columns = inspect_parquet_files(general_text_files)
+        rec_total_rows, rec_columns = inspect_parquet_files(rec_data_files)
+        total_rows = general_total_rows + rec_total_rows
+        target_columns = list(dict.fromkeys(general_columns + rec_columns))
 
-        logger.info("Step 4: Loading recommendation data...")
-        rec_data_df = load_all_parquet_files(rec_data_files, engine=args.engine)
-        
-        # 3. Merge data
-        logger.info("=" * 60)
-        logger.info("Step 5: Merging data...")
-        if len(general_text_df) == 0 and len(rec_data_df) == 0:
-            logger.error("No data loaded")
+        logger.info(
+            "Inspection complete: general text %s rows + recommendation data %s rows = total %s rows",
+            general_total_rows,
+            rec_total_rows,
+            total_rows,
+        )
+
+        if total_rows == 0:
+            logger.error("No data found")
             sys.exit(1)
 
-        if len(general_text_df) == 0:
-            combined_df = rec_data_df
-            logger.info("Using only recommendation data")
-        elif len(rec_data_df) == 0:
-            combined_df = general_text_df
-            logger.info("Using only general text data")
-        else:
-            combined_df = pd.concat([general_text_df, rec_data_df], ignore_index=True)
-            logger.info(f"Merge complete: general text {len(general_text_df)} rows + recommendation data {len(rec_data_df)} rows = total {len(combined_df)} rows")
-        
-        # 4. Split data
         logger.info("=" * 60)
-        logger.info("Step 6: Splitting data...")
-        output_files = split_dataframe(
-            combined_df,
-            max_rows=args.max_rows,
-            output_dir=args.output_dir,
-            prefix="part"
-        )
-        
+        logger.info("Step 4: Streaming and splitting data...")
+        if args.engine == 'pyarrow':
+            output_files = stream_split_dataframe(
+                general_text_files=general_text_files,
+                rec_data_files=rec_data_files,
+                max_rows=args.max_rows,
+                output_dir=args.output_dir,
+                target_columns=target_columns,
+                total_rows=total_rows,
+                batch_size=args.streaming_batch_size,
+                prefix="part",
+            )
+        else:
+            logger.info("Using in-memory fallback for fastparquet engine")
+            general_text_df = load_all_parquet_files(general_text_files, engine=args.engine)
+            rec_data_df = load_all_parquet_files(rec_data_files, engine=args.engine)
+            if len(general_text_df) == 0:
+                combined_df = rec_data_df
+            elif len(rec_data_df) == 0:
+                combined_df = general_text_df
+            else:
+                combined_df = pd.concat([general_text_df, rec_data_df], ignore_index=True)
+            output_files = split_dataframe(
+                combined_df,
+                max_rows=args.max_rows,
+                output_dir=args.output_dir,
+                prefix="part"
+            )
+
         # 5. Generate file list JSON
         logger.info("=" * 60)
-        logger.info("Step 7: Generating file list JSON...")
+        logger.info("Step 5: Generating file list JSON...")
         output_dir_path = Path(args.output_dir)
         json_file_path = output_dir_path / "file_list.json"
 
@@ -270,7 +403,7 @@ def main():
         logger.info("=" * 60)
         logger.info("Processing complete!")
         logger.info(f"Input files: general text {len(general_text_files)} files, recommendation data {len(rec_data_files)} files")
-        logger.info(f"Total data rows: {len(combined_df)}")
+        logger.info(f"Total data rows: {total_rows}")
         logger.info(f"Output files: {len(output_files)}")
         logger.info(f"Output directory: {args.output_dir}")
         logger.info(f"File list JSON: {json_file_path}")
@@ -286,4 +419,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
