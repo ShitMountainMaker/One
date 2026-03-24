@@ -47,7 +47,7 @@ echo "DATASET_CONFIG=$DATASET_CONFIG"
 echo "OUTPUT_DIR=$OUTPUT_DIR"
 echo "LOG_DIR=$LOG_DIR"
 
-torchrun \
+python3 -m torch.distributed.run \
   --nnodes "$NNODES" \
   --nproc_per_node "$NPROC_PER_NODE" \
   --master_addr "$MASTER_ADDR" \
