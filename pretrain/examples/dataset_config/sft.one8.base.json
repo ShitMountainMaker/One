@@ -1,0 +1,20 @@
+{
+  "name": "chat_completion_parquet",
+  "sources": "/data/user/cwu319/OpenOneRec-base/output/split_data_sft/file_list.json",
+  "only_assistant_loss": false,
+  "max_length": 4096,
+  "base_model_dir": "/data/user/cwu319/OpenOneRec-base/models/OneRec-1.7B-pretrain",
+  "num_workers": 0,
+  "num_epochs": 1,
+  "cut_to_pad": 1,
+  "model_class": "Qwen3ForCausalLM",
+  "full_attention": false,
+  "local_shuffle_buffer_size": 1000,
+  "max_sample_length": 4096,
+  "local_shuffle_random_fetch": 0.0001,
+  "itemic_id_range": [
+    151669,
+    176246
+  ],
+  "add_think_pattern": true
+}
