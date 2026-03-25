@@ -1,6 +1,6 @@
 {
   "name": "chat_completion_parquet",
-  "sources": "/data/user/cwu319/OpenOneRec-base/output/split_data_sft/file_list.json",
+  "sources": "/data/user/cwu319/OpenOneRec-base/output/split_data_sft_8192/file_list.json",
   "only_assistant_loss": false,
   "max_length": 8192,
   "base_model_dir": "/data/user/cwu319/OpenOneRec-base/models/OneRec-1.7B-pretrain",
