@@ -11,6 +11,7 @@ ROWS_PER_SHARD="${ROWS_PER_SHARD:-1000}"
 
 cd "$PROJECT_ROOT"
 source .env/activate_onerec_npu.sh
+cd "$PROJECT_ROOT"
 
 python3 data/scripts/filter_sft_by_length.py \
   --input-file-list "$INPUT_FILE_LIST" \

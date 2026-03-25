@@ -24,6 +24,9 @@ SAVE_CHECKPOINT_PER_STEP="${SAVE_CHECKPOINT_PER_STEP:-50}"
 MINIBATCH_SIZE="${MINIBATCH_SIZE:-2048}"
 LOGGING_PER_STEP="${LOGGING_PER_STEP:-5}"
 SEED="${SEED:-19260817}"
+RESUME_FROM="${RESUME_FROM:-}"
+RESUME_FROM_TAG="${RESUME_FROM_TAG:-}"
+RESUME_TRAINING_STATE="${RESUME_TRAINING_STATE:-0}"
 
 cd "$PROJECT_ROOT"
 source .env/activate_onerec_npu.sh
@@ -46,6 +49,17 @@ echo "MODEL_DIR=$MODEL_DIR"
 echo "DATASET_CONFIG=$DATASET_CONFIG"
 echo "OUTPUT_DIR=$OUTPUT_DIR"
 echo "LOG_DIR=$LOG_DIR"
+
+RESUME_ARGS=()
+if [[ -n "$RESUME_FROM" ]]; then
+  RESUME_ARGS+=(--resume_from "$RESUME_FROM")
+fi
+if [[ -n "$RESUME_FROM_TAG" ]]; then
+  RESUME_ARGS+=(--resume_from_tag "$RESUME_FROM_TAG")
+fi
+if [[ "$RESUME_TRAINING_STATE" == "1" ]]; then
+  RESUME_ARGS+=(--resume_training_state)
+fi
 
 python3 -m torch.distributed.run \
   --nnodes "$NNODES" \
@@ -75,4 +89,5 @@ python3 -m torch.distributed.run \
   --seed "$SEED" \
   --enable_gradient_checkpointing \
   --use_chunked_loss_computer \
+  "${RESUME_ARGS[@]}" \
   2>&1 | tee "$LOG_DIR/torchrun.log"
